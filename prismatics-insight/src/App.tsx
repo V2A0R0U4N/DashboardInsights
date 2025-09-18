@@ -9,6 +9,7 @@ import Analytics from "./pages/Analytics";
 import UsersPage from "./pages/Users"; 
 import NotFound from "./pages/NotFound";
 import "./App.css";
+import AnalyticsPage from "./pages/Analytics";
 
 const queryClient = new QueryClient();
 
@@ -21,7 +22,7 @@ const App = () => (
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<Index />} />
-          <Route path="/analytics" element={<Analytics />} />
+          <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="/users" element={<UsersPage />} /> 
           <Route path="*" element={<NotFound />} />
         </Routes>

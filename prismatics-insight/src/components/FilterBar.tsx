@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useFilters } from "@/contexts/FilterContext";
 import { Calendar, Filter, Users } from "lucide-react";
 
 const dateRanges = [
@@ -22,17 +22,10 @@ const userTypes = [
 ];
 
 export default function FilterBar() {
-  const [activeFilters, setActiveFilters] = useState({
-    dateRange: "30d",
-    requestType: "all",
-    userType: "all",
-  });
+  const { filters, setFilters } = useFilters();
 
   const updateFilter = (key: string, value: string) => {
-    setActiveFilters(prev => ({ ...prev, [key]: value }));
-    console.log(`Filter updated: ${key} = ${value}`);
-    // In a real application, you would trigger a data refetch here
-    // e.g., fetchData({ ...activeFilters, [key]: value });
+    setFilters({ [key]: value });
   };
 
   return (
@@ -50,7 +43,7 @@ export default function FilterBar() {
             <button
               key={range.value}
               onClick={() => updateFilter("dateRange", range.value)}
-              className={`filter-pill ${activeFilters.dateRange === range.value ? "active" : ""}`}
+              className={`filter-pill ${filters.dateRange === range.value ? "active" : ""}`}
             >
               {range.label}
             </button>
@@ -66,7 +59,7 @@ export default function FilterBar() {
             <button
               key={type.value}
               onClick={() => updateFilter("requestType", type.value)}
-              className={`filter-pill ${activeFilters.requestType === type.value ? "active" : ""}`}
+              className={`filter-pill ${filters.requestType === type.value ? "active" : ""}`}
             >
               {type.label}
             </button>
@@ -82,7 +75,7 @@ export default function FilterBar() {
             <button
               key={type.value}
               onClick={() => updateFilter("userType", type.value)}
-              className={`filter-pill ${activeFilters.userType === type.value ? "active" : ""}`}
+              className={`filter-pill ${filters.userType === type.value ? "active" : ""}`}
             >
               {type.label}
             </button>
