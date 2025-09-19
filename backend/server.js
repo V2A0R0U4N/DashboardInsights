@@ -35,7 +35,6 @@ async function run() {
         await client.connect();
         console.log("✅ Connected to MongoDB Atlas!");
 
-        // ⚠️ update db/collection names if different
         const database = client.db("test");
         const collection = database.collection("agentlogs");
 
@@ -44,13 +43,19 @@ async function run() {
             io.emit('dashboardUpdate', { message: "Data has been updated" });
         });
 
-        // ----------------- OVERVIEW ENDPOINT -----------------
+        // ----------------- ENHANCED OVERVIEW ENDPOINT -----------------
         app.get('/api/overview-data', async (req, res) => {
             try {
-                const thirtyDaysAgo = new Date();
-                thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+                // Date calculations for different periods
+                const now = new Date();
+                const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+                const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+                const fourteenDaysAgo = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+                const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
 
-                // KPIs
+                // ===========================================
+                // BASIC KPIs (Enhanced)
+                // ===========================================
                 const [kpiData] = await collection.aggregate([
                     {
                         $group: {
@@ -58,7 +63,17 @@ async function run() {
                             totalUsers: { $addToSet: "$user_email" },
                             totalQueries: { $sum: 1 },
                             avgResponseTime: { $avg: "$time.total_time" },
-                            successCount: { $sum: { $cond: [{ $eq: ["$status", true] }, 1, 0] } }
+                            successCount: { $sum: { $cond: [{ $eq: ["$status", true] }, 1, 0] } },
+                            totalRestaurants: { $addToSet: "$restaurant_id" },
+                            // Token usage calculation
+                            totalTokens: {
+                                $sum: {
+                                    $add: [
+                                        { $ifNull: ["$token_usage.petpooja_dashboard.query_reformer_token_usage.total_tokens", 0] },
+                                        { $ifNull: ["$token_usage.petpooja_dashboard.query_router_token_usage.total_tokens", 0] }
+                                    ]
+                                }
+                            }
                         }
                     },
                     {
@@ -66,43 +81,283 @@ async function run() {
                             _id: 0,
                             totalUsers: { $size: "$totalUsers" },
                             totalQueries: "$totalQueries",
+                            successCount: "$successCount",
+                            avgResponseTime: { $round: ["$avgResponseTime", 0] },
+                            totalRestaurants: { $size: "$totalRestaurants" },
+                            totalTokens: "$totalTokens"
+                        }
+                    },
+                    {
+                        $addFields: {
                             successRate: {
-                                $multiply: [
-                                    { $divide: ["$successCount", { $ifNull: ["$totalQueries", 1] }] },
-                                    100
+                                $cond: [
+                                    { $eq: ["$totalQueries", 0] },
+                                    0,
+                                    { $round: [{ $multiply: [{ $divide: ["$successCount", "$totalQueries"] }, 100] }, 1] }
                                 ]
-                            },
-                            avgResponseTime: { $round: ["$avgResponseTime", 0] }
+                            }
                         }
                     }
                 ]).toArray();
 
-                // Query volume (30d)
+                // ===========================================
+                // FIXED WEEKLY GROWTH CALCULATION
+                // ===========================================
+                const weeklyGrowthData = await collection.aggregate([
+                    {
+                        $addFields: {
+                            convertedDate: { $toDate: "$query_time" }
+                        }
+                    },
+                    {
+                        $facet: {
+                            currentWeek: [
+                                { 
+                                    $match: { 
+                                        convertedDate: { 
+                                            $gte: sevenDaysAgo,
+                                            $lt: now
+                                        } 
+                                    } 
+                                },
+                                {
+                                    $group: {
+                                        _id: null,
+                                        queries: { $sum: 1 },
+                                        users: { $addToSet: "$user_email" },
+                                        avgResponseTime: { $avg: "$time.total_time" },
+                                        successCount: { $sum: { $cond: [{ $eq: ["$status", true] }, 1, 0] } }
+                                    }
+                                },
+                                {
+                                    $project: {
+                                        queries: 1,
+                                        users: { $size: "$users" },
+                                        avgResponseTime: { $round: ["$avgResponseTime", 0] },
+                                        successRate: {
+                                            $cond: [
+                                                { $eq: ["$queries", 0] },
+                                                0,
+                                                { $multiply: [{ $divide: ["$successCount", "$queries"] }, 100] }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ],
+                            previousWeek: [
+                                { 
+                                    $match: { 
+                                        convertedDate: { 
+                                            $gte: fourteenDaysAgo,
+                                            $lt: sevenDaysAgo
+                                        } 
+                                    } 
+                                },
+                                {
+                                    $group: {
+                                        _id: null,
+                                        queries: { $sum: 1 },
+                                        users: { $addToSet: "$user_email" },
+                                        avgResponseTime: { $avg: "$time.total_time" },
+                                        successCount: { $sum: { $cond: [{ $eq: ["$status", true] }, 1, 0] } }
+                                    }
+                                },
+                                {
+                                    $project: {
+                                        queries: 1,
+                                        users: { $size: "$users" },
+                                        avgResponseTime: { $round: ["$avgResponseTime", 0] },
+                                        successRate: {
+                                            $cond: [
+                                                { $eq: ["$queries", 0] },
+                                                0,
+                                                { $multiply: [{ $divide: ["$successCount", "$queries"] }, 100] }
+                                            ]
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]).toArray();
+
+                // Calculate growth percentages
+                const currentWeek = weeklyGrowthData[0]?.currentWeek[0] || { queries: 0, users: 0, avgResponseTime: 0, successRate: 0 };
+                const previousWeek = weeklyGrowthData[0]?.previousWeek[0] || { queries: 0, users: 0, avgResponseTime: 0, successRate: 0 };
+
+                const calculateGrowth = (current, previous) => {
+                    if (previous === 0 && current > 0) return 100;
+                    if (previous > 0 && current === 0) return -100;
+                    if (previous === 0 && current === 0) return 0;
+                    return Math.round(((current - previous) / previous) * 100 * 10) / 10;
+                };
+
+                const weeklyGrowth = {
+                    queries: calculateGrowth(currentWeek.queries, previousWeek.queries),
+                    users: calculateGrowth(currentWeek.users, previousWeek.users),
+                    responseTime: calculateGrowth(currentWeek.avgResponseTime, previousWeek.avgResponseTime),
+                    successRate: Math.round((currentWeek.successRate - previousWeek.successRate) * 10) / 10
+                };
+
+                // ===========================================
+                // QUERY VOLUME TRENDS (Last 30 days)
+                // ===========================================
                 const queryVolume = await collection.aggregate([
                     { $addFields: { convertedDate: { $toDate: "$query_time" } } },
                     { $match: { convertedDate: { $gte: thirtyDaysAgo } } },
                     {
                         $group: {
                             _id: { $dateToString: { format: "%Y-%m-%d", date: "$convertedDate" } },
-                            count: { $sum: 1 }
+                            queries: { $sum: 1 },
+                            avgResponseTime: { $avg: "$time.total_time" },
+                            successCount: { $sum: { $cond: [{ $eq: ["$status", true] }, 1, 0] } }
+                        }
+                    },
+                    {
+                        $addFields: {
+                            successRate: {
+                                $cond: [
+                                    { $eq: ["$queries", 0] },
+                                    0,
+                                    { $round: [{ $multiply: [{ $divide: ["$successCount", "$queries"] }, 100] }, 1] }
+                                ]
+                            }
                         }
                     },
                     { $sort: { _id: 1 } },
-                    { $project: { date: "$_id", queries: "$count", _id: 0 } }
+                    { 
+                        $project: { 
+                            date: "$_id", 
+                            queries: 1, 
+                            avgResponseTime: { $round: ["$avgResponseTime", 0] },
+                            successRate: 1,
+                            _id: 0 
+                        } 
+                    }
                 ]).toArray();
 
-                // Peak hour
-                const [peakHour] = await collection.aggregate([
-                    { $group: { _id: { $hour: { $toDate: "$query_time" } }, count: { $sum: 1 } } },
-                    { $sort: { count: -1 } },
-                    { $limit: 1 }
+                // ===========================================
+                // TOP PERFORMING RESTAURANTS
+                // ===========================================
+                const topRestaurants = await collection.aggregate([
+                    { $addFields: { convertedDate: { $toDate: "$query_time" } } },
+                    { $match: { convertedDate: { $gte: thirtyDaysAgo } } },
+                    {
+                        $group: {
+                            _id: "$restaurant_id",
+                            queries: { $sum: 1 },
+                            successCount: { $sum: { $cond: [{ $eq: ["$status", true] }, 1, 0] } },
+                            avgResponseTime: { $avg: "$time.total_time" },
+                            uniqueUsers: { $addToSet: "$user_email" }
+                        }
+                    },
+                    {
+                        $addFields: {
+                            successRate: {
+                                $cond: [
+                                    { $eq: ["$queries", 0] },
+                                    0,
+                                    { $round: [{ $multiply: [{ $divide: ["$successCount", "$queries"] }, 100] }, 1] }
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        $project: {
+                            name: { $concat: ["Restaurant ", "$_id"] },
+                            restaurantId: "$_id",
+                            queries: 1,
+                            successRate: 1,
+                            avgResponseTime: { $round: ["$avgResponseTime", 0] },
+                            uniqueUsers: { $size: "$uniqueUsers" },
+                            _id: 0
+                        }
+                    },
+                    { $sort: { queries: -1 } },
+                    { $limit: 10 }
                 ]).toArray();
 
-                // Top request type
-                const [topRequestType] = await collection.aggregate([
+                // ===========================================
+                // REQUEST TYPE DISTRIBUTION
+                // ===========================================
+                const requestDistribution = await collection.aggregate([
+                    { $unwind: { path: "$petpooja_dashboard.request_type_identifier", preserveNullAndEmptyArrays: true } },
                     {
                         $group: {
                             _id: "$petpooja_dashboard.request_type_identifier.raw_output",
+                            count: { $sum: 1 },
+                            avgResponseTime: { $avg: "$time.total_time" }
+                        }
+                    },
+                    {
+                        $project: {
+                            name: { $ifNull: ["$_id", "Unknown"] },
+                            value: "$count",
+                            avgResponseTime: { $round: ["$avgResponseTime", 0] },
+                            _id: 0
+                        }
+                    },
+                    { $sort: { value: -1 } }
+                ]).toArray();
+
+                // ===========================================
+                // USER GROWTH ANALYSIS
+                // ===========================================
+                const userGrowth = await collection.aggregate([
+                    { $addFields: { convertedDate: { $toDate: "$query_time" } } },
+                    { $match: { convertedDate: { $gte: thirtyDaysAgo } } },
+                    {
+                        $group: {
+                            _id: {
+                                date: { $dateToString: { format: "%Y-%m-%d", date: "$convertedDate" } },
+                                userType: {
+                                    $cond: { if: { $eq: ["$user_type", 1] }, then: "New", else: "Returning" }
+                                }
+                            },
+                            count: { $sum: 1 }
+                        }
+                    },
+                    {
+                        $group: {
+                            _id: "$_id.date",
+                            newUsers: {
+                                $sum: { $cond: [{ $eq: ["$_id.userType", "New"] }, "$count", 0] }
+                            },
+                            returningUsers: {
+                                $sum: { $cond: [{ $eq: ["$_id.userType", "Returning"] }, "$count", 0] }
+                            }
+                        }
+                    },
+                    { $sort: { _id: 1 } },
+                    { 
+                        $project: { 
+                            date: "$_id", 
+                            newUsers: 1, 
+                            returningUsers: 1, 
+                            _id: 0 
+                        } 
+                    }
+                ]).toArray();
+
+                // ===========================================
+                // ACTIVE USERS (Last 5 minutes)
+                // ===========================================
+                const [activeUsersData] = await collection.aggregate([
+                    { $addFields: { convertedDate: { $toDate: "$query_time" } } },
+                    { $match: { convertedDate: { $gte: fiveMinutesAgo } } },
+                    { $group: { _id: "$user_email" } },
+                    { $count: "count" }
+                ]).toArray();
+
+                // ===========================================
+                // PEAK HOUR ANALYSIS
+                // ===========================================
+                const [peakHour] = await collection.aggregate([
+                    { $addFields: { convertedDate: { $toDate: "$query_time" } } },
+                    { $match: { convertedDate: { $gte: sevenDaysAgo } } },
+                    {
+                        $group: {
+                            _id: { $hour: "$convertedDate" },
                             count: { $sum: 1 }
                         }
                     },
@@ -110,40 +365,89 @@ async function run() {
                     { $limit: 1 }
                 ]).toArray();
 
-                // Request distribution
-                const requestDistribution = await collection.aggregate([
-                    {
-                        $group: {
-                            _id: "$petpooja_dashboard.request_type_identifier.raw_output",
-                            value: { $sum: 1 }
-                        }
+                // ===========================================
+                // LATEST CRITICAL ERROR
+                // ===========================================
+                const [latestError] = await collection.aggregate([
+                    { 
+                        $match: { 
+                            status: false, 
+                            $or: [
+                                { error_message: { $exists: true, $ne: null } },
+                                { message: { $exists: true, $ne: "" } }
+                            ]
+                        } 
                     },
-                    { $project: { name: "$_id", value: 1, _id: 0 } }
+                    { $sort: { query_time: -1 } },
+                    { $limit: 1 },
+                    { 
+                        $project: { 
+                            error: { 
+                                $ifNull: [
+                                    "$error_message", 
+                                    { $ifNull: ["$message", "Unknown error"] }
+                                ]
+                            }, 
+                            timestamp: "$query_time",
+                            _id: 0 
+                        } 
+                    }
                 ]).toArray();
 
-                // Top restaurants
-                const topRestaurants = await collection.aggregate([
-                    { $group: { _id: "$restaurant_id", queries: { $sum: 1 } } },
-                    { $sort: { queries: -1 } },
-                    { $limit: 5 },
-                    { $project: { name: { $concat: ["Restaurant ", "$_id"] }, queries: 1, _id: 0 } }
-                ]).toArray();
-
+                // ===========================================
+                // RESPONSE STRUCTURE
+                // ===========================================
                 res.json({
-                    kpis: kpiData || { totalUsers: 0, totalQueries: 0, successRate: 0, avgResponseTime: 0 },
+                    // Basic KPIs
+                    kpis: kpiData || { 
+                        totalUsers: 0, 
+                        totalQueries: 0, 
+                        successRate: 0, 
+                        avgResponseTime: 0,
+                        totalRestaurants: 0,
+                        totalTokens: 0
+                    },
+
+                    // Growth metrics
+                    weeklyGrowth: {
+                        queries: weeklyGrowth.queries,
+                        users: weeklyGrowth.users,
+                        responseTime: weeklyGrowth.responseTime,
+                        successRate: weeklyGrowth.successRate,
+                        tokens: weeklyGrowth.tokens,
+                        currentWeek,
+                        previousWeek
+                    },
+
+                    // Charts data
                     queryVolume,
-                    peakHour: peakHour?._id ?? 'N/A',
-                    topRequestType: topRequestType?._id || 'N/A',
+                    topRestaurants,
                     requestDistribution,
-                    topRestaurants
+                    userGrowth,
+
+                    // Live metrics
+                    activeUsers: activeUsersData?.count || 0,
+                    peakHour: peakHour?._id || 'N/A',
+                    
+                    // System health
+                    latestError: latestError?.error || "No recent errors",
+                    errorTimestamp: latestError?.timestamp || null,
+
+                    // Metadata
+                    timestamp: new Date().toISOString(),
+                    dataRange: {
+                        from: thirtyDaysAgo.toISOString(),
+                        to: now.toISOString()
+                    }
                 });
+
             } catch (error) {
                 console.error("Error in /api/overview-data:", error);
                 res.status(500).json({ message: error.message });
             }
         });
 
-        // ----------------- ANALYTICS ENDPOINT -----------------
+        // ----------------- ANALYTICS ENDPOINT (Keep existing) -----------------
         app.get('/api/analytics-data', async (req, res) => {
             try {
                 const [phaseBreakdown] = await collection.aggregate([
@@ -152,8 +456,16 @@ async function run() {
                             _id: null,
                             query_reformer: { $avg: "$time.petpooja_dashboard.query_reformer.context_query_reforming_time" },
                             query_router: { $avg: "$time.petpooja_dashboard.query_router.query_routing_time" },
-                            request_identifier: { $avg: { $arrayElemAt: ["$time.petpooja_dashboard.request_type_identifier.request_type_identification_time", 0] } },
-                            api_calling: { $avg: { $arrayElemAt: ["$time.petpooja_dashboard.api_function_calling.api_function_calling_total_time", 0] } }
+                            request_identifier: {
+                                $avg: {
+                                    $arrayElemAt: ["$time.petpooja_dashboard.request_type_identifier.request_type_identification_time", 0]
+                                }
+                            },
+                            api_calling: {
+                                $avg: {
+                                    $arrayElemAt: ["$time.petpooja_dashboard.api_function_calling.api_function_calling_total_time", 0]
+                                }
+                            }
                         }
                     },
                     {
@@ -188,32 +500,9 @@ async function run() {
                     }
                 ]).toArray();
 
-                const latencyPercentiles = await collection.aggregate([
-                    { $sort: { "time.total_time": 1 } },
-                    { $group: { _id: null, times: { $push: "$time.total_time" } } },
-                    {
-                        $project: {
-                            _id: 0,
-                            p50: { $arrayElemAt: ["$times", { $floor: { $multiply: [0.50, { $size: "$times" }] } }] },
-                            p90: { $arrayElemAt: ["$times", { $floor: { $multiply: [0.90, { $size: "$times" }] } }] },
-                            p95: { $arrayElemAt: ["$times", { $floor: { $multiply: [0.95, { $size: "$times" }] } }] }
-                        }
-                    }
-                ]).toArray();
-
-                const errorTrends = await collection.aggregate([
-                    { $match: { status: false, error_message: { $exists: true, $ne: null } } },
-                    { $group: { _id: "$error_message", count: { $sum: 1 } } },
-                    { $sort: { count: -1 } },
-                    { $limit: 5 },
-                    { $project: { name: "$_id", count: 1, _id: 0 } }
-                ]).toArray();
-
                 res.json({
                     phaseBreakdown: phaseBreakdown?.data || [],
-                    tokenBreakdown: tokenBreakdown?.data || [],
-                    latencyPercentiles: latencyPercentiles[0] || { p50: 0, p90: 0, p95: 0 },
-                    errorTrends
+                    tokenBreakdown: tokenBreakdown?.data || []
                 });
             } catch (error) {
                 console.error("Error in /api/analytics-data:", error);
@@ -221,7 +510,7 @@ async function run() {
             }
         });
 
-        // ----------------- USERS ENDPOINT -----------------
+        // ----------------- USERS ENDPOINT (Keep existing) -----------------
         app.get('/api/users-data', async (req, res) => {
             try {
                 const userActivity = await collection.aggregate([
@@ -259,7 +548,7 @@ async function run() {
             }
         });
 
-        // ----------------- LIVE FEED -----------------
+        // ----------------- LIVE FEED (Keep existing) -----------------
         app.get('/api/live-feed', async (req, res) => {
             try {
                 const data = await collection.find().sort({ query_time: -1 }).limit(10).toArray();
