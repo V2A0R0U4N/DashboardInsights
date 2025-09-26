@@ -30,22 +30,25 @@ import DonutChart from "@/components/charts/DonutChart";
 interface WeeklyGrowth {
   queries: number;
   users: number;
+  returningUsers: number;
   responseTime: number;
   successRate: number;
   tokens: number;
   currentWeek: {
     queries: number;
     users: number;
+    returningUsers: number;
     avgResponseTime: number;
     successRate: number;
-    tokens: number;
+    totalTokens: number;
   };
   previousWeek: {
     queries: number;
     users: number;
+    returningUsers: number;
     avgResponseTime: number;
     successRate: number;
-    tokens: number;
+    totalTokens: number;
   };
 }
 
@@ -90,14 +93,38 @@ interface OverviewData {
   timestamp: string;
 }
 
-// Helper component for growth indicators
-const GrowthIndicator = ({ value, showIcon = true }: { value: number; showIcon?: boolean }) => {
-  const isPositive = value > 0;
-  const isNeutral = Math.abs(value) < 0.1;
+// Enhanced Growth Indicator Component with better styling and logic
+const GrowthIndicator = ({ 
+  value, 
+  showIcon = true, 
+  size = "sm",
+  reverseColors = false // For metrics where decrease is good (like response time)
+}: { 
+  value: number; 
+  showIcon?: boolean; 
+  size?: "sm" | "md"; 
+  reverseColors?: boolean;
+}) => {
+  // Sanitize value - ensure it's a valid number
+  const numericValue = typeof value === 'number' && !isNaN(value) ? value : 0;
+  
+  const isPositive = numericValue > 0;
+  const isNeutral = Math.abs(numericValue) < 0.1;
   
   const getColor = () => {
-    if (isNeutral) return "text-gray-500";
-    return isPositive ? "text-green-600" : "text-red-600";
+    if (isNeutral) return "text-gray-500 bg-gray-100";
+    
+    if (reverseColors) {
+      // For response time - lower is better
+      return isPositive 
+        ? "text-red-600 bg-red-50" 
+        : "text-green-600 bg-green-50";
+    } else {
+      // For most metrics - higher is better
+      return isPositive 
+        ? "text-green-600 bg-green-50" 
+        : "text-red-600 bg-red-50";
+    }
   };
 
   const getIcon = () => {
@@ -106,12 +133,13 @@ const GrowthIndicator = ({ value, showIcon = true }: { value: number; showIcon?:
   };
 
   const Icon = getIcon();
+  const sizeClasses = size === "md" ? "text-sm px-2 py-1" : "text-xs px-1.5 py-0.5";
 
   return (
-    <div className={`flex items-center gap-1 ${getColor()}`}>
-      {showIcon && <Icon className="w-4 h-4" />}
-      <span className="text-sm font-semibold">
-        {isPositive ? '+' : ''}{value}%
+    <div className={`inline-flex items-center gap-1 ${getColor()} ${sizeClasses} rounded-full font-medium`}>
+      {showIcon && <Icon className={size === "md" ? "w-3 h-3" : "w-2.5 h-2.5"} />}
+      <span>
+        {isPositive && numericValue !== 0 ? '+' : ''}{numericValue.toFixed(1)}%
       </span>
     </div>
   );
@@ -131,6 +159,7 @@ const Index = () => {
       const jsonData = await res.json();
       console.log("📊 Overview data loaded:", jsonData);
       setData(jsonData);
+      setError(null); // Clear any previous errors
     } catch (error) {
       console.error("Failed to fetch overview data:", error);
       setError(
@@ -144,9 +173,17 @@ const Index = () => {
   useEffect(() => {
     fetchData();
     const socket = io("http://localhost:5000");
-    socket.on("dashboardUpdate", fetchData);
+    socket.on("dashboardUpdate", () => {
+      console.log("📡 Dashboard update received, refreshing data...");
+      fetchData();
+    });
+    
+    // Set up periodic refresh every 30 seconds
+    const interval = setInterval(fetchData, 30000);
+    
     return () => {
       socket.disconnect();
+      clearInterval(interval);
     };
   }, []);
 
@@ -187,7 +224,7 @@ const Index = () => {
 
   // Format peak hour for display
   const formatPeakHour = (hour: string | number) => {
-    if (hour === 'N/A') return 'N/A';
+    if (hour === 'N/A' || hour === null || hour === undefined) return 'N/A';
     const hourNum = typeof hour === 'string' ? parseInt(hour) : hour;
     if (isNaN(hourNum)) return 'N/A';
     const displayHour = hourNum === 0 ? 12 : hourNum > 12 ? hourNum - 12 : hourNum;
@@ -200,6 +237,22 @@ const Index = () => {
     ...item,
     color: ['#8B5CF6', '#06B6D4', '#F59E0B', '#EF4444', '#10B981'][index % 5]
   }));
+
+  // Safe accessor for weekly growth data
+  const safeWeeklyGrowth = {
+    queries: weeklyGrowth?.queries || 0,
+    users: weeklyGrowth?.users || 0,
+    returningUsers: weeklyGrowth?.returningUsers || 0,
+    responseTime: weeklyGrowth?.responseTime || 0,
+    successRate: weeklyGrowth?.successRate || 0,
+    tokens: weeklyGrowth?.tokens || 0,
+    currentWeek: weeklyGrowth?.currentWeek || { 
+      queries: 0, users: 0, returningUsers: 0, avgResponseTime: 0, successRate: 0, totalTokens: 0 
+    },
+    previousWeek: weeklyGrowth?.previousWeek || { 
+      queries: 0, users: 0, returningUsers: 0, avgResponseTime: 0, successRate: 0, totalTokens: 0 
+    }
+  };
 
   return (
     <DashboardLayout>
@@ -214,7 +267,7 @@ const Index = () => {
           </p>
         </div>
 
-        {/* Enhanced KPI Cards with Growth Indicators */}
+        {/* Enhanced KPI Cards with Improved Growth Indicators */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6 animate-fade-in">
           <div className="relative">
             <KPICard
@@ -222,10 +275,10 @@ const Index = () => {
               value={kpis.totalUsers || 0}
               icon={Users}
               variant="purple"
-              subtitle={`${weeklyGrowth.currentWeek.users} active this week`}
+              subtitle={`${safeWeeklyGrowth.currentWeek.users} active this week`}
             />
-            <div className="absolute top-4 right-4">
-              <GrowthIndicator value={weeklyGrowth.users} />
+            <div className="absolute top-3 right-3">
+              <GrowthIndicator value={safeWeeklyGrowth.users} size="sm" />
             </div>
           </div>
 
@@ -235,10 +288,10 @@ const Index = () => {
               value={kpis.totalQueries || 0}
               icon={HelpCircle}
               variant="teal"
-              subtitle={`${weeklyGrowth.currentWeek.queries} this week`}
+              subtitle={`${safeWeeklyGrowth.currentWeek.queries} this week`}
             />
-            <div className="absolute top-4 right-4">
-              <GrowthIndicator value={weeklyGrowth.queries} />
+            <div className="absolute top-3 right-3">
+              <GrowthIndicator value={safeWeeklyGrowth.queries} size="sm" />
             </div>
           </div>
 
@@ -248,10 +301,10 @@ const Index = () => {
               value={`${(kpis.successRate || 0).toFixed(1)}%`}
               icon={CheckCircle}
               variant="success"
-              subtitle={`${weeklyGrowth.currentWeek.successRate.toFixed(1)}% this week`}
+              subtitle={`${safeWeeklyGrowth.currentWeek.successRate.toFixed(1)}% this week`}
             />
-            <div className="absolute top-4 right-4">
-              <GrowthIndicator value={weeklyGrowth.successRate} />
+            <div className="absolute top-3 right-3">
+              <GrowthIndicator value={safeWeeklyGrowth.successRate} size="sm" />
             </div>
           </div>
 
@@ -261,10 +314,14 @@ const Index = () => {
               value={`${kpis.avgResponseTime || 0}ms`}
               icon={Clock}
               variant="warning"
-              subtitle={`${weeklyGrowth.currentWeek.avgResponseTime}ms this week`}
+              subtitle={`${safeWeeklyGrowth.currentWeek.avgResponseTime}ms this week`}
             />
-            <div className="absolute top-4 right-4">
-              <GrowthIndicator value={weeklyGrowth.responseTime} />
+            <div className="absolute top-3 right-3">
+              <GrowthIndicator 
+                value={safeWeeklyGrowth.responseTime} 
+                size="sm" 
+                reverseColors={true}
+              />
             </div>
           </div>
 
@@ -274,15 +331,15 @@ const Index = () => {
               value={`${(kpis.totalTokens || 0).toLocaleString()}`}
               icon={Zap}
               variant="pink"
-              subtitle={`${(weeklyGrowth.currentWeek.tokens || 0).toLocaleString()} this week`}
+              subtitle={`${(safeWeeklyGrowth.currentWeek.totalTokens || 0).toLocaleString()} this week`}
             />
-            <div className="absolute top-4 right-4">
-              <GrowthIndicator value={weeklyGrowth.tokens || 0} />
+            <div className="absolute top-3 right-3">
+              <GrowthIndicator value={safeWeeklyGrowth.tokens} size="sm" />
             </div>
           </div>
         </div>
 
-        {/* Enhanced Insights Row */}
+        {/* Enhanced Insights Row with Database-driven Peak Hour */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6 animate-slide-up">
           <InsightCard
             icon={Activity}
@@ -293,14 +350,14 @@ const Index = () => {
           <InsightCard
             icon={ArrowUpRight}
             title="Weekly Growth"
-            value={`${weeklyGrowth.queries > 0 ? '+' : ''}${weeklyGrowth.queries}%`}
+            value={`${safeWeeklyGrowth.queries > 0 ? '+' : ''}${safeWeeklyGrowth.queries.toFixed(1)}%`}
             subtitle="Query volume vs. last week"
           />
           <InsightCard
             icon={Clock}
             title="Peak Hour"
             value={formatPeakHour(peakHour)}
-            subtitle="Highest activity time"
+            subtitle="Highest activity time (last 7 days)"
           />
           <InsightCard
             icon={Building}
@@ -316,7 +373,7 @@ const Index = () => {
           <div className="lg:col-span-2">
             <ChartCard 
               title="Query Volume & Performance Trends" 
-              subtitle="Daily queries with response time and success rate"
+              subtitle="Daily queries with response time and success rate (Last 30 days)"
               icon={TrendingUp}
               data={queryVolume}
               valueKey="queries"
@@ -356,7 +413,7 @@ const Index = () => {
           {/* Top Restaurants */}
           <ChartCard 
             title="Top Performing Restaurants" 
-            subtitle="Most active establishments"
+            subtitle="Most active establishments (Last 30 days)"
             icon={Building}
             data={topRestaurants.slice(0, 8)}
             valueKey="queries"
@@ -370,7 +427,7 @@ const Index = () => {
             />
           </ChartCard>
 
-          {/* System Health & Alerts */}
+          {/* Enhanced System Health & Alerts */}
           <div className="space-y-6">
             {/* System Health Card */}
             <div className="card-premium p-6">
@@ -385,11 +442,45 @@ const Index = () => {
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-sm text-muted-foreground">Current Success Rate</span>
-                  <span className="text-sm font-semibold text-green-600">{kpis.successRate?.toFixed(1) || 0}%</span>
+                  <span className="text-sm font-semibold text-green-600">{(kpis.successRate || 0).toFixed(1)}%</span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-sm text-muted-foreground">Active Restaurants</span>
                   <span className="text-sm font-semibold">{kpis.totalRestaurants || 0}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-muted-foreground">Avg Response Time</span>
+                  <span className="text-sm font-semibold">{kpis.avgResponseTime || 0}ms</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Enhanced Weekly Growth Summary */}
+            <div className="card-premium p-6">
+              <h3 className="text-lg font-semibold text-foreground mb-4 flex items-center gap-2">
+                <TrendingUp className="w-5 h-5 text-blue-500" />
+                Weekly Growth Summary
+              </h3>
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-muted-foreground">Queries</span>
+                  <GrowthIndicator value={safeWeeklyGrowth.queries} size="md" />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-muted-foreground">Users</span>
+                  <GrowthIndicator value={safeWeeklyGrowth.users} size="md" />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-muted-foreground">Returning Users</span>
+                  <GrowthIndicator value={safeWeeklyGrowth.returningUsers} size="md" />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-muted-foreground">Response Time</span>
+                  <GrowthIndicator value={safeWeeklyGrowth.responseTime} size="md" reverseColors={true} />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-muted-foreground">Success Rate</span>
+                  <GrowthIndicator value={safeWeeklyGrowth.successRate} size="md" />
                 </div>
               </div>
             </div>
@@ -401,11 +492,25 @@ const Index = () => {
                 System Alerts
               </h3>
               <div className="space-y-3">
-                <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
-                  <div className="text-sm font-medium text-red-800">Latest Error</div>
-                  <div className="text-xs text-red-600 mt-1 break-words">
+                <div className={`p-3 border rounded-lg ${
+                  latestError === "No recent errors" 
+                    ? "bg-green-50 border-green-200" 
+                    : "bg-red-50 border-red-200"
+                }`}>
+                  <div className={`text-sm font-medium ${
+                    latestError === "No recent errors" 
+                      ? "text-green-800" 
+                      : "text-red-800"
+                  }`}>
+                    {latestError === "No recent errors" ? "System Status" : "Latest Error"}
+                  </div>
+                  <div className={`text-xs mt-1 break-words ${
+                    latestError === "No recent errors" 
+                      ? "text-green-600" 
+                      : "text-red-600"
+                  }`}>
                     {latestError === "No recent errors" ? (
-                      <span className="text-green-600">✅ No recent errors detected</span>
+                      <span>✅ No recent errors detected</span>
                     ) : (
                       <>
                         {latestError.length > 100 ? `${latestError.substring(0, 100)}...` : latestError}
@@ -418,17 +523,6 @@ const Index = () => {
                     )}
                   </div>
                 </div>
-                
-                {/* Growth Summary */}
-                <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                  <div className="text-sm font-medium text-blue-800">Weekly Growth Summary</div>
-                  <div className="text-xs text-blue-600 mt-1 space-y-1">
-                    <div>Queries: <GrowthIndicator value={weeklyGrowth.queries} showIcon={false} /></div>
-                    <div>Users: <GrowthIndicator value={weeklyGrowth.users} showIcon={false} /></div>
-                    <div>Response Time: <GrowthIndicator value={weeklyGrowth.responseTime} showIcon={false} /></div>
-                    <div>Tokens: <GrowthIndicator value={weeklyGrowth.tokens || 0} showIcon={false} /></div>
-                  </div>
-                </div>
               </div>
             </div>
           </div>
@@ -438,7 +532,7 @@ const Index = () => {
         <div className="grid grid-cols-1 gap-8">
           <ChartCard 
             title="User Growth Analysis" 
-            subtitle="New vs. returning user activity over time"
+            subtitle="New vs. returning user activity over time (Last 30 days)"
             icon={UserPlus}
             data={userGrowth}
             valueKey="newUsers"
@@ -453,17 +547,18 @@ const Index = () => {
           </ChartCard>
         </div>
 
-        {/* Data Summary Footer */}
+        {/* Enhanced Data Summary Footer */}
         <div className="flex items-center justify-between text-sm text-muted-foreground bg-white/50 rounded-lg p-4 animate-fade-in">
-          <div>
-            Last updated: {new Date(data.timestamp).toLocaleString()}
-          </div>
           <div className="flex items-center gap-4">
-            <span>Data range: Last 30 days</span>
+            <span>Last updated: {new Date(data.timestamp).toLocaleString()}</span>
             <div className="flex items-center gap-1">
               <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
               <span>Live data</span>
             </div>
+          </div>
+          <div className="flex items-center gap-4">
+            <span>Data range: Last 30 days</span>
+            <span>Peak hour based on last 7 days</span>
           </div>
         </div>
       </div>

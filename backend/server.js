@@ -27,8 +27,37 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-const uri = process.env.MONGO_URI;
+const uri = process.env.MONGO_URI || "mongodb+srv://tithi1610:tithi161004@agentdb.l1e56vx.mongodb.net/?retryWrites=true&w=majority&appName=AgentDB";
 const client = new MongoClient(uri);
+
+// Helper function to safely parse dates
+function parseDate(dateString) {
+    if (!dateString) return null;
+
+    let parsedDate;
+    parsedDate = new Date(dateString);
+    if (!isNaN(parsedDate.getTime())) return parsedDate;
+
+    if (typeof dateString === 'string') {
+        parsedDate = new Date(dateString.replace(/\s/, 'T'));
+        if (!isNaN(parsedDate.getTime())) return parsedDate;
+    }
+
+    return null;
+}
+
+// Helper function to calculate safe percentage growth
+function calculateSafeGrowth(current, previous, decimalPlaces = 1) {
+    if (typeof current !== 'number') current = 0;
+    if (typeof previous !== 'number') previous = 0;
+
+    if (previous === 0 && current === 0) return 0;
+    if (previous === 0 && current > 0) return 100;
+    if (previous > 0 && current === 0) return -100;
+
+    const growth = ((current - previous) / previous) * 100;
+    return Math.round(growth * Math.pow(10, decimalPlaces)) / Math.pow(10, decimalPlaces);
+}
 
 async function run() {
     try {
@@ -46,7 +75,8 @@ async function run() {
         // ----------------- ENHANCED OVERVIEW ENDPOINT -----------------
         app.get('/api/overview-data', async (req, res) => {
             try {
-                // Date calculations for different periods
+                console.log("📊 Fetching overview data...");
+
                 const now = new Date();
                 const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
                 const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -54,9 +84,20 @@ async function run() {
                 const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
 
                 // ===========================================
-                // BASIC KPIs (Enhanced)
+                // BASIC KPIs
                 // ===========================================
                 const [kpiData] = await collection.aggregate([
+                    {
+                        $addFields: {
+                            convertedDate: {
+                                $cond: {
+                                    if: { $type: "$query_time" },
+                                    then: { $dateFromString: { dateString: "$query_time", onError: null } },
+                                    else: null
+                                }
+                            }
+                        }
+                    },
                     {
                         $group: {
                             _id: null,
@@ -65,12 +106,25 @@ async function run() {
                             avgResponseTime: { $avg: "$time.total_time" },
                             successCount: { $sum: { $cond: [{ $eq: ["$status", true] }, 1, 0] } },
                             totalRestaurants: { $addToSet: "$restaurant_id" },
-                            // Token usage calculation
                             totalTokens: {
                                 $sum: {
                                     $add: [
-                                        { $ifNull: ["$token_usage.petpooja_dashboard.query_reformer_token_usage.total_tokens", 0] },
-                                        { $ifNull: ["$token_usage.petpooja_dashboard.query_router_token_usage.total_tokens", 0] }
+                                        { $toInt: { $ifNull: ["$token_usage.petpooja_dashboard.query_reformer_token_usage.total_tokens", 0] } },
+                                        {
+                                            $toInt: {
+                                                $ifNull: [
+                                                    {
+                                                        $cond: {
+                                                            if: { $isArray: "$token_usage.petpooja_dashboard.query_router_token_usage.total_tokens" },
+                                                            then: { $arrayElemAt: ["$token_usage.petpooja_dashboard.query_router_token_usage.total_tokens", 0] },
+                                                            else: "$token_usage.petpooja_dashboard.query_router_token_usage.total_tokens"
+                                                        }
+                                                    },
+                                                    0
+                                                ]
+                                            }
+                                        },
+                                        { $toInt: { $ifNull: [{ $arrayElemAt: ["$token_usage.petpooja_dashboard.request_type_identifier.total_tokens", 0] }, 0] } }
                                     ]
                                 }
                             }
@@ -82,9 +136,9 @@ async function run() {
                             totalUsers: { $size: "$totalUsers" },
                             totalQueries: "$totalQueries",
                             successCount: "$successCount",
-                            avgResponseTime: { $round: ["$avgResponseTime", 0] },
+                            avgResponseTime: { $round: [{ $ifNull: ["$avgResponseTime", 0] }, 0] },
                             totalRestaurants: { $size: "$totalRestaurants" },
-                            totalTokens: "$totalTokens"
+                            totalTokens: { $ifNull: ["$totalTokens", 0] }
                         }
                     },
                     {
@@ -101,77 +155,119 @@ async function run() {
                 ]).toArray();
 
                 // ===========================================
-                // FIXED WEEKLY GROWTH CALCULATION
+                // ENHANCED WEEKLY GROWTH CALCULATION
                 // ===========================================
                 const weeklyGrowthData = await collection.aggregate([
                     {
                         $addFields: {
-                            convertedDate: { $toDate: "$query_time" }
+                            convertedDate: {
+                                $cond: [
+                                    { $eq: [{ $type: "$query_time" }, "string"] },
+                                    { $dateFromString: { dateString: "$query_time", onError: null } },
+                                    "$query_time"
+                                ]
+                            }
                         }
                     },
                     {
                         $facet: {
                             currentWeek: [
-                                { 
-                                    $match: { 
-                                        convertedDate: { 
-                                            $gte: sevenDaysAgo,
-                                            $lt: now
-                                        } 
-                                    } 
+                                {
+                                    $match: {
+                                        convertedDate: { $ne: null, $gte: sevenDaysAgo, $lt: now }
+                                    }
                                 },
                                 {
                                     $group: {
                                         _id: null,
                                         queries: { $sum: 1 },
                                         users: { $addToSet: "$user_email" },
+                                        returningUsers: {
+                                            $addToSet: { $cond: [{ $ne: ["$user_type", 1] }, "$user_email", null] }
+                                        },
                                         avgResponseTime: { $avg: "$time.total_time" },
-                                        successCount: { $sum: { $cond: [{ $eq: ["$status", true] }, 1, 0] } }
+                                        successCount: { $sum: { $cond: [{ $eq: ["$status", true] }, 1, 0] } },
+                                        totalTokens: {
+                                            $sum: {
+                                                $add: [
+                                                    { $ifNull: ["$token_usage.petpooja_dashboard.query_reformer_token_usage.total_tokens", 0] },
+                                                    { $ifNull: ["$token_usage.petpooja_dashboard.query_router_token_usage.total_tokens", 0] },
+                                                    {
+                                                        $let: {
+                                                            vars: { req: { $arrayElemAt: ["$token_usage.petpooja_dashboard.request_type_identifier", 0] } },
+                                                            in: { $ifNull: ["$$req.total_tokens", 0] }
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        }
                                     }
                                 },
                                 {
                                     $project: {
                                         queries: 1,
                                         users: { $size: "$users" },
-                                        avgResponseTime: { $round: ["$avgResponseTime", 0] },
+                                        returningUsers: {
+                                            $size: { $filter: { input: "$returningUsers", cond: { $ne: ["$$this", null] } } }
+                                        },
+                                        avgResponseTime: { $round: [{ $ifNull: ["$avgResponseTime", 0] }, 0] },
+                                        totalTokens: { $ifNull: ["$totalTokens", 0] },
                                         successRate: {
                                             $cond: [
                                                 { $eq: ["$queries", 0] },
                                                 0,
-                                                { $multiply: [{ $divide: ["$successCount", "$queries"] }, 100] }
+                                                { $round: [{ $multiply: [{ $divide: ["$successCount", "$queries"] }, 100] }, 1] }
                                             ]
                                         }
                                     }
                                 }
                             ],
                             previousWeek: [
-                                { 
-                                    $match: { 
-                                        convertedDate: { 
-                                            $gte: fourteenDaysAgo,
-                                            $lt: sevenDaysAgo
-                                        } 
-                                    } 
+                                {
+                                    $match: {
+                                        convertedDate: { $ne: null, $gte: fourteenDaysAgo, $lt: sevenDaysAgo }
+                                    }
                                 },
                                 {
                                     $group: {
                                         _id: null,
                                         queries: { $sum: 1 },
                                         users: { $addToSet: "$user_email" },
+                                        returningUsers: {
+                                            $addToSet: { $cond: [{ $ne: ["$user_type", 1] }, "$user_email", null] }
+                                        },
                                         avgResponseTime: { $avg: "$time.total_time" },
-                                        successCount: { $sum: { $cond: [{ $eq: ["$status", true] }, 1, 0] } }
+                                        successCount: { $sum: { $cond: [{ $eq: ["$status", true] }, 1, 0] } },
+                                        totalTokens: {
+                                            $sum: {
+                                                $add: [
+                                                    { $ifNull: ["$token_usage.petpooja_dashboard.query_reformer_token_usage.total_tokens", 0] },
+                                                    { $ifNull: ["$token_usage.petpooja_dashboard.query_router_token_usage.total_tokens", 0] },
+                                                    {
+                                                        $let: {
+                                                            vars: { req: { $arrayElemAt: ["$token_usage.petpooja_dashboard.request_type_identifier", 0] } },
+                                                            in: { $ifNull: ["$$req.total_tokens", 0] }
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        }
                                     }
                                 },
                                 {
                                     $project: {
                                         queries: 1,
                                         users: { $size: "$users" },
-                                        avgResponseTime: { $round: ["$avgResponseTime", 0] },
+                                        returningUsers: {
+                                            $size: { $filter: { input: "$returningUsers", cond: { $ne: ["$$this", null] } } }
+                                        },
+                                        avgResponseTime: { $round: [{ $ifNull: ["$avgResponseTime", 0] }, 0] },
+                                        totalTokens: { $ifNull: ["$totalTokens", 0] },
                                         successRate: {
                                             $cond: [
                                                 { $eq: ["$queries", 0] },
                                                 0,
-                                                { $multiply: [{ $divide: ["$successCount", "$queries"] }, 100] }
+                                                { $round: [{ $multiply: [{ $divide: ["$successCount", "$queries"] }, 100] }, 1] }
                                             ]
                                         }
                                     }
@@ -181,30 +277,38 @@ async function run() {
                     }
                 ]).toArray();
 
-                // Calculate growth percentages
-                const currentWeek = weeklyGrowthData[0]?.currentWeek[0] || { queries: 0, users: 0, avgResponseTime: 0, successRate: 0 };
-                const previousWeek = weeklyGrowthData[0]?.previousWeek[0] || { queries: 0, users: 0, avgResponseTime: 0, successRate: 0 };
-
-                const calculateGrowth = (current, previous) => {
-                    if (previous === 0 && current > 0) return 100;
-                    if (previous > 0 && current === 0) return -100;
-                    if (previous === 0 && current === 0) return 0;
-                    return Math.round(((current - previous) / previous) * 100 * 10) / 10;
-                };
+                const currentWeek = weeklyGrowthData[0]?.currentWeek[0] || { queries: 0, users: 0, returningUsers: 0, avgResponseTime: 0, successRate: 0, totalTokens: 0 };
+                const previousWeek = weeklyGrowthData[0]?.previousWeek[0] || { queries: 0, users: 0, returningUsers: 0, avgResponseTime: 0, successRate: 0, totalTokens: 0 };
 
                 const weeklyGrowth = {
-                    queries: calculateGrowth(currentWeek.queries, previousWeek.queries),
-                    users: calculateGrowth(currentWeek.users, previousWeek.users),
-                    responseTime: calculateGrowth(currentWeek.avgResponseTime, previousWeek.avgResponseTime),
-                    successRate: Math.round((currentWeek.successRate - previousWeek.successRate) * 10) / 10
+                    queries: calculateSafeGrowth(currentWeek.queries, previousWeek.queries),
+                    users: calculateSafeGrowth(currentWeek.users, previousWeek.users),
+                    returningUsers: calculateSafeGrowth(currentWeek.returningUsers, previousWeek.returningUsers),
+                    responseTime: calculateSafeGrowth(currentWeek.avgResponseTime, previousWeek.avgResponseTime),
+                    successRate: Math.round((currentWeek.successRate - previousWeek.successRate) * 10) / 10,
+                    tokens: calculateSafeGrowth(currentWeek.totalTokens, previousWeek.totalTokens)
                 };
 
                 // ===========================================
                 // QUERY VOLUME TRENDS (Last 30 days)
                 // ===========================================
                 const queryVolume = await collection.aggregate([
-                    { $addFields: { convertedDate: { $toDate: "$query_time" } } },
-                    { $match: { convertedDate: { $gte: thirtyDaysAgo } } },
+                    {
+                        $addFields: {
+                            convertedDate: {
+                                $cond: [
+                                    { $eq: [{ $type: "$query_time" }, "string"] },
+                                    { $dateFromString: { dateString: "$query_time", onError: null } },
+                                    "$query_time"
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        $match: {
+                            convertedDate: { $ne: null, $gte: thirtyDaysAgo }
+                        }
+                    },
                     {
                         $group: {
                             _id: { $dateToString: { format: "%Y-%m-%d", date: "$convertedDate" } },
@@ -225,14 +329,14 @@ async function run() {
                         }
                     },
                     { $sort: { _id: 1 } },
-                    { 
-                        $project: { 
-                            date: "$_id", 
-                            queries: 1, 
-                            avgResponseTime: { $round: ["$avgResponseTime", 0] },
+                    {
+                        $project: {
+                            date: "$_id",
+                            queries: 1,
+                            avgResponseTime: { $round: [{ $ifNull: ["$avgResponseTime", 0] }, 0] },
                             successRate: 1,
-                            _id: 0 
-                        } 
+                            _id: 0
+                        }
                     }
                 ]).toArray();
 
@@ -240,8 +344,23 @@ async function run() {
                 // TOP PERFORMING RESTAURANTS
                 // ===========================================
                 const topRestaurants = await collection.aggregate([
-                    { $addFields: { convertedDate: { $toDate: "$query_time" } } },
-                    { $match: { convertedDate: { $gte: thirtyDaysAgo } } },
+                    {
+                        $addFields: {
+                            convertedDate: {
+                                $cond: [
+                                    { $eq: [{ $type: "$query_time" }, "string"] },
+                                    { $dateFromString: { dateString: "$query_time", onError: null } },
+                                    "$query_time"
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        $match: {
+                            convertedDate: { $ne: null, $gte: thirtyDaysAgo },
+                            restaurant_id: { $exists: true, $ne: null }
+                        }
+                    },
                     {
                         $group: {
                             _id: "$restaurant_id",
@@ -264,11 +383,11 @@ async function run() {
                     },
                     {
                         $project: {
-                            name: { $concat: ["Restaurant ", "$_id"] },
+                            name: { $concat: ["Restaurant ", { $toString: "$_id" }] },
                             restaurantId: "$_id",
                             queries: 1,
                             successRate: 1,
-                            avgResponseTime: { $round: ["$avgResponseTime", 0] },
+                            avgResponseTime: { $round: [{ $ifNull: ["$avgResponseTime", 0] }, 0] },
                             uniqueUsers: { $size: "$uniqueUsers" },
                             _id: 0
                         }
@@ -276,6 +395,7 @@ async function run() {
                     { $sort: { queries: -1 } },
                     { $limit: 10 }
                 ]).toArray();
+
 
                 // ===========================================
                 // REQUEST TYPE DISTRIBUTION
@@ -293,7 +413,7 @@ async function run() {
                         $project: {
                             name: { $ifNull: ["$_id", "Unknown"] },
                             value: "$count",
-                            avgResponseTime: { $round: ["$avgResponseTime", 0] },
+                            avgResponseTime: { $round: [{ $ifNull: ["$avgResponseTime", 0] }, 0] },
                             _id: 0
                         }
                     },
@@ -301,17 +421,35 @@ async function run() {
                 ]).toArray();
 
                 // ===========================================
-                // USER GROWTH ANALYSIS
+                // USER GROWTH ANALYSIS (Last 30 days)
                 // ===========================================
                 const userGrowth = await collection.aggregate([
-                    { $addFields: { convertedDate: { $toDate: "$query_time" } } },
-                    { $match: { convertedDate: { $gte: thirtyDaysAgo } } },
+                    {
+                        $addFields: {
+                            convertedDate: {
+                                $cond: [
+                                    { $eq: [{ $type: "$query_time" }, "string"] },
+                                    { $dateFromString: { dateString: "$query_time", onError: null } },
+                                    "$query_time"
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        $match: {
+                            convertedDate: { $ne: null, $gte: thirtyDaysAgo }
+                        }
+                    },
                     {
                         $group: {
                             _id: {
                                 date: { $dateToString: { format: "%Y-%m-%d", date: "$convertedDate" } },
                                 userType: {
-                                    $cond: { if: { $eq: ["$user_type", 1] }, then: "New", else: "Returning" }
+                                    $cond: [
+                                        { $eq: ["$user_type", 1] },
+                                        "New",
+                                        "Returning"
+                                    ]
                                 }
                             },
                             count: { $sum: 1 }
@@ -329,13 +467,13 @@ async function run() {
                         }
                     },
                     { $sort: { _id: 1 } },
-                    { 
-                        $project: { 
-                            date: "$_id", 
-                            newUsers: 1, 
-                            returningUsers: 1, 
-                            _id: 0 
-                        } 
+                    {
+                        $project: {
+                            date: "$_id",
+                            newUsers: 1,
+                            returningUsers: 1,
+                            _id: 0
+                        }
                     }
                 ]).toArray();
 
@@ -343,75 +481,106 @@ async function run() {
                 // ACTIVE USERS (Last 5 minutes)
                 // ===========================================
                 const [activeUsersData] = await collection.aggregate([
-                    { $addFields: { convertedDate: { $toDate: "$query_time" } } },
-                    { $match: { convertedDate: { $gte: fiveMinutesAgo } } },
-                    { $group: { _id: "$user_email" } },
-                    { $count: "count" }
-                ]).toArray();
-
-                // ===========================================
-                // PEAK HOUR ANALYSIS
-                // ===========================================
-                const [peakHour] = await collection.aggregate([
-                    { $addFields: { convertedDate: { $toDate: "$query_time" } } },
-                    { $match: { convertedDate: { $gte: sevenDaysAgo } } },
                     {
-                        $group: {
-                            _id: { $hour: "$convertedDate" },
-                            count: { $sum: 1 }
+                        $addFields: {
+                            convertedDate: {
+                                $cond: {
+                                    if: { $type: "$query_time" },
+                                    then: { $dateFromString: { dateString: "$query_time", onError: null } },
+                                    else: null
+                                }
+                            }
                         }
                     },
-                    { $sort: { count: -1 } },
-                    { $limit: 1 }
+                    {
+                        $match: {
+                            convertedDate: { $ne: null, $gte: fiveMinutesAgo }
+                        }
+                    },
+                    { $group: { _id: "$user_email" } },
+                    { $count: "count" }
                 ]).toArray();
 
                 // ===========================================
                 // LATEST CRITICAL ERROR
                 // ===========================================
                 const [latestError] = await collection.aggregate([
-                    { 
-                        $match: { 
-                            status: false, 
+                    {
+                        $match: {
+                            status: false,
                             $or: [
                                 { error_message: { $exists: true, $ne: null } },
                                 { message: { $exists: true, $ne: "" } }
                             ]
-                        } 
+                        }
                     },
                     { $sort: { query_time: -1 } },
                     { $limit: 1 },
-                    { 
-                        $project: { 
-                            error: { 
+                    {
+                        $project: {
+                            error: {
                                 $ifNull: [
-                                    "$error_message", 
+                                    "$error_message",
                                     { $ifNull: ["$message", "Unknown error"] }
                                 ]
-                            }, 
+                            },
                             timestamp: "$query_time",
-                            _id: 0 
-                        } 
+                            _id: 0
+                        }
                     }
                 ]).toArray();
 
                 // ===========================================
+                // PEAK HOUR CALCULATION (Last 30 days)
+                // ===========================================
+                const [peakHourData] = await collection.aggregate([
+                    {
+                        $addFields: {
+                            convertedDate: {
+                                $cond: {
+                                    if: { $eq: [{ $type: "$query_time" }, "string"] },
+                                    then: { $dateFromString: { dateString: "$query_time", onError: null } },
+                                    else: "$query_time"
+                                }
+                            }
+                        }
+                    },
+                    {
+                        $match: {
+                            convertedDate: { $ne: null, $gte: thirtyDaysAgo }
+                        }
+                    },
+                    {
+                        $group: {
+                            _id: { $hour: "$convertedDate" },
+                            queries: { $sum: 1 }
+                        }
+                    },
+                    { $sort: { queries: -1 } },
+                    { $limit: 1 }
+                ]).toArray();
+
+                const peakHour = peakHourData?._id ?? null;
+
+                // ===========================================
                 // RESPONSE STRUCTURE
                 // ===========================================
-                res.json({
+                const responseData = {
                     // Basic KPIs
-                    kpis: kpiData || { 
-                        totalUsers: 0, 
-                        totalQueries: 0, 
-                        successRate: 0, 
+                    kpis: kpiData || {
+                        totalUsers: 0,
+                        totalQueries: 0,
+                        successRate: 0,
                         avgResponseTime: 0,
                         totalRestaurants: 0,
                         totalTokens: 0
                     },
 
-                    // Growth metrics
+                    // Enhanced growth metrics
                     weeklyGrowth: {
                         queries: weeklyGrowth.queries,
                         users: weeklyGrowth.users,
+                        returningUsers: weeklyGrowth.returningUsers,
                         responseTime: weeklyGrowth.responseTime,
                         successRate: weeklyGrowth.successRate,
                         tokens: weeklyGrowth.tokens,
@@ -427,8 +596,8 @@ async function run() {
 
                     // Live metrics
                     activeUsers: activeUsersData?.count || 0,
-                    peakHour: peakHour?._id || 'N/A',
-                    
+                    peakHour: peakHour || 'N/A',
+
                     // System health
                     latestError: latestError?.error || "No recent errors",
                     errorTimestamp: latestError?.timestamp || null,
@@ -439,15 +608,21 @@ async function run() {
                         from: thirtyDaysAgo.toISOString(),
                         to: now.toISOString()
                     }
-                });
+                };
+
+                console.log("✅ Overview data prepared successfully");
+                res.json(responseData);
 
             } catch (error) {
-                console.error("Error in /api/overview-data:", error);
-                res.status(500).json({ message: error.message });
+                console.error("❌ Error in /api/overview-data:", error);
+                res.status(500).json({
+                    message: error.message,
+                    error: "Failed to fetch overview data"
+                });
             }
         });
 
-        // ----------------- ANALYTICS ENDPOINT (Keep existing) -----------------
+        // Keep existing endpoints unchanged
         app.get('/api/analytics-data', async (req, res) => {
             try {
                 const [phaseBreakdown] = await collection.aggregate([
@@ -510,7 +685,6 @@ async function run() {
             }
         });
 
-        // ----------------- USERS ENDPOINT (Keep existing) -----------------
         app.get('/api/users-data', async (req, res) => {
             try {
                 const userActivity = await collection.aggregate([
@@ -548,7 +722,6 @@ async function run() {
             }
         });
 
-        // ----------------- LIVE FEED (Keep existing) -----------------
         app.get('/api/live-feed', async (req, res) => {
             try {
                 const data = await collection.find().sort({ query_time: -1 }).limit(10).toArray();
