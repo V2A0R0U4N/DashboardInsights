@@ -1,10 +1,9 @@
 import { cva, type VariantProps } from "class-variance-authority";
 import { LucideIcon } from "lucide-react";
-import { motion } from "framer-motion"; // --- IMPORT ADDED HERE ---
-
+import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { Skeleton } from "./ui/skeleton";
-import { Badge } from "./ui/badge";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./ui/tooltip";
 
 const kpiCardVariants = cva(
   "rounded-2xl border bg-card text-card-foreground shadow-sm p-6 transition-all duration-300 hover:shadow-lg",
@@ -35,7 +34,7 @@ export interface KPICardProps
   value: string | number;
   subtitle?: string;
   icon: LucideIcon;
-  change?: number;
+  tooltip?: string;
   isLoading?: boolean;
   delay?: number;
 }
@@ -47,7 +46,7 @@ export default function KPICard({
   value,
   subtitle,
   icon: Icon,
-  change,
+  tooltip,
   isLoading,
   delay = 0,
   ...props
@@ -56,9 +55,8 @@ export default function KPICard({
     return <Skeleton className="h-40 w-full" />;
   }
 
-  // Only pass props that are valid for motion.div
   const {
-    onDrag, // Remove problematic props
+    onDrag,
     onDragStart,
     onDragEnd,
     onDragOver,
@@ -66,31 +64,43 @@ export default function KPICard({
     ...motionSafeProps
   } = props;
 
+  const stringValue = value?.toString() || "";
+  const dynamicSize =
+    stringValue.length > 10
+      ? "text-xl"
+      : stringValue.length > 7
+      ? "text-2xl"
+      : "text-3xl";
+
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.5, delay: delay / 1000 }}
-      className={cn(kpiCardVariants({ variant, className }))}
-      {...motionSafeProps}
-    >
-      <div className="flex items-start justify-between">
-        <div className="space-y-1">
-          <p className="text-sm font-medium text-muted-foreground">{title}</p>
-          <h3 className="text-3xl font-bold">{value}</h3>
-          {subtitle && <p className="text-xs text-muted-foreground">{subtitle}</p>}
-        </div>
-        <div className="p-3 bg-background rounded-full">
-          <Icon className="w-6 h-6" />
-        </div>
-      </div>
-      {change !== undefined && (
-        <div className="mt-4">
-          <Badge variant={change >= 0 ? "success" : "destructive"}>
-            {change >= 0 ? `+${change}` : change}%
-          </Badge>
-        </div>
-      )}
-    </motion.div>
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.5, delay: delay / 1000 }}
+            className={cn(kpiCardVariants({ variant, className }))}
+            {...motionSafeProps}
+          >
+            <div className="flex items-start justify-between">
+              <div className="space-y-1">
+                <p className="text-sm font-medium text-muted-foreground">{title}</p>
+                <h3 className={`font-bold tracking-tight break-words ${dynamicSize}`}>
+                  {typeof value === "number" ? value.toLocaleString() : value}
+                </h3>
+                {subtitle && (
+                  <p className="text-xs text-muted-foreground">{subtitle}</p>
+                )}
+              </div>
+              <div className="p-3 bg-background rounded-full shrink-0">
+                <Icon className="w-6 h-6" />
+              </div>
+            </div>
+          </motion.div>
+        </TooltipTrigger>
+        {tooltip && <TooltipContent>{tooltip}</TooltipContent>}
+      </Tooltip>
+    </TooltipProvider>
   );
 }

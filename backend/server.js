@@ -623,8 +623,10 @@ async function run() {
         });
 
         // Keep existing endpoints unchanged
+        // inside your server.js - replace the existing /api/analytics-data route with this:
         app.get('/api/analytics-data', async (req, res) => {
             try {
+                // Phase breakdown (unchanged)
                 const [phaseBreakdown] = await collection.aggregate([
                     {
                         $group: {
@@ -632,14 +634,10 @@ async function run() {
                             query_reformer: { $avg: "$time.petpooja_dashboard.query_reformer.context_query_reforming_time" },
                             query_router: { $avg: "$time.petpooja_dashboard.query_router.query_routing_time" },
                             request_identifier: {
-                                $avg: {
-                                    $arrayElemAt: ["$time.petpooja_dashboard.request_type_identifier.request_type_identification_time", 0]
-                                }
+                                $avg: { $first: "$time.petpooja_dashboard.request_type_identifier.request_type_identification_time" }
                             },
                             api_calling: {
-                                $avg: {
-                                    $arrayElemAt: ["$time.petpooja_dashboard.api_function_calling.api_function_calling_total_time", 0]
-                                }
+                                $avg: { $first: "$time.petpooja_dashboard.api_function_calling.api_function_calling_total_time" }
                             }
                         }
                     },
@@ -656,6 +654,7 @@ async function run() {
                     }
                 ]).toArray();
 
+                // Prompt vs Completion tokens
                 const [tokenBreakdown] = await collection.aggregate([
                     {
                         $group: {
@@ -675,9 +674,112 @@ async function run() {
                     }
                 ]).toArray();
 
+                // Latency percentiles (p50, p95, p99) — require `method`
+                const [latencyPercentiles] = await collection.aggregate([
+                    {
+                        $group: {
+                            _id: null,
+                            percentiles: {
+                                $percentile: {
+                                    input: "$time.total_time",
+                                    p: [0.5, 0.95, 0.99],
+                                    method: "approximate"
+                                }
+                            }
+                        }
+                    },
+                    {
+                        $project: {
+                            _id: 0,
+                            p50: { $arrayElemAt: ["$percentiles", 0] },
+                            p95: { $arrayElemAt: ["$percentiles", 1] },
+                            p99: { $arrayElemAt: ["$percentiles", 2] }
+                        }
+                    }
+                ]).toArray();
+
+                // Error trends (top 5 distinct error texts)
+                const errorTrends = await collection.aggregate([
+                    {
+                        $match: {
+                            status: false,
+                            $or: [
+                                { error_message: { $exists: true, $ne: "" } },
+                                { message: { $exists: true, $ne: "" } }
+                            ]
+                        }
+                    },
+                    {
+                        $project: {
+                            errorText: { $ifNull: ["$error_message", "$message"] }
+                        }
+                    },
+                    {
+                        $group: { _id: "$errorText", count: { $sum: 1 } }
+                    },
+                    { $sort: { count: -1 } },
+                    { $limit: 5 },
+                    { $project: { _id: 0, name: "$_id", count: 1 } }
+                ]).toArray();
+
+                // Request type metrics (avg response time + success rate)
+                const requestTypeMetrics = await collection.aggregate([
+                    { $unwind: { path: "$petpooja_dashboard.request_type_identifier", preserveNullAndEmptyArrays: true } },
+                    {
+                        $group: {
+                            _id: "$petpooja_dashboard.request_type_identifier.raw_output",
+                            avgResponseTime: { $avg: "$time.total_time" },
+                            successRate: { $avg: { $cond: [{ $eq: ["$status", true] }, 1, 0] } }
+                        }
+                    },
+                    {
+                        $project: {
+                            _id: 0,
+                            name: { $ifNull: ["$_id", "Unknown"] },
+                            avgResponseTime: { $round: [{ $ifNull: ["$avgResponseTime", 0] }, 0] },
+                            successRate: { $round: [{ $multiply: ["$successRate", 100] }, 1] }
+                        }
+                    },
+                    { $sort: { avgResponseTime: -1 } }
+                ]).toArray();
+
+                // Dynamic resource utilization: flatten token_usage.petpooja_dashboard fields
+                const resourceUtilizationAgg = await collection.aggregate([
+                    {
+                        $project: {
+                            components: { $objectToArray: "$token_usage.petpooja_dashboard" }
+                        }
+                    },
+                    { $unwind: "$components" },
+                    {
+                        $group: {
+                            _id: "$components.k",
+                            totalTokens: { $sum: { $ifNull: ["$components.v.total_tokens", 0] } },
+                            // avgTokensPerQuery: average of that component's total_tokens across documents (can be null if values missing)
+                            avgTokensPerQuery: { $avg: { $ifNull: ["$components.v.total_tokens", null] } }
+                        }
+                    },
+                    { $sort: { totalTokens: -1 } },
+                    {
+                        $project: {
+                            _id: 0,
+                            name: "$_id",
+                            totalTokens: 1,
+                            avgTokensPerQuery: { $cond: [{ $eq: ["$avgTokensPerQuery", null] }, null, { $round: ["$avgTokensPerQuery", 1] }] }
+                        }
+                    }
+                ]).toArray();
+
+                const resourceUtilization = resourceUtilizationAgg; // array of { name, totalTokens, avgTokensPerQuery }
+
+                // return everything
                 res.json({
                     phaseBreakdown: phaseBreakdown?.data || [],
-                    tokenBreakdown: tokenBreakdown?.data || []
+                    tokenBreakdown: tokenBreakdown?.data || [],
+                    requestTypeMetrics,
+                    latencyPercentiles: latencyPercentiles?.[0] ? latencyPercentiles[0] : (latencyPercentiles || { p50: 0, p95: 0, p99: 0 }),
+                    errorTrends,
+                    resourceUtilization
                 });
             } catch (error) {
                 console.error("Error in /api/analytics-data:", error);
@@ -685,42 +787,218 @@ async function run() {
             }
         });
 
-        app.get('/api/users-data', async (req, res) => {
-            try {
-                const userActivity = await collection.aggregate([
-                    {
-                        $group: {
-                            _id: "$user_email",
-                            queryCount: { $sum: 1 },
-                            lastActivity: { $max: "$query_time" }
-                        }
-                    },
-                    { $sort: { queryCount: -1 } },
-                    { $limit: 20 },
-                    { $project: { email: "$_id", queryCount: 1, lastActivity: 1, _id: 0 } }
-                ]).toArray();
 
-                const userTypes = await collection.aggregate([
-                    {
-                        $group: {
-                            _id: {
-                                $cond: {
-                                    if: { $eq: ["$user_type", 1] },
-                                    then: "First-time",
-                                    else: "Returning"
-                                }
-                            },
-                            count: { $sum: 1 }
-                        }
-                    }
-                ]).toArray();
+        // ====================== USERS DATA ======================
+        // ---------------- USERS DATA (robust) ----------------
+app.get("/api/users-data", async (req, res) => {
+    try {
+        const projection = {
+            user_type: 1,
+            user_email: 1,
+            query_time: 1,
+            session_id: 1,
+            question: 1,
+            user_rights: 1,
+            status: 1,
+            "petpooja_dashboard.request_type_identifier.raw_output": 1
+        };
 
-                res.json({ userActivity, userTypes });
-            } catch (error) {
-                console.error("Error in /api/users-data:", error);
-                res.status(500).json({ message: error.message });
+        const rawData = await collection.find({}, { projection }).toArray();
+
+        if (!Array.isArray(rawData) || rawData.length === 0) {
+            return res.json({
+                userTypes: [],
+                userActivity: [],
+                queriesPerSession: [],
+                durations: [],
+                duplicateQueries: [],
+                avgQueriesPerSession: 0,
+                retentionWeekly: [],
+                queryComplexityByUserType: [],
+                userJourneyTransitions: [],
+                engagement: []
+            });
+        }
+
+        const safeStr = (v) => (v === undefined || v === null ? "" : String(v));
+        const asDate = (v) => {
+            const d = new Date(v);
+            return isNaN(d.getTime()) ? null : d;
+        };
+
+        // -------- USER TYPES ----------
+        const firstTimeCount = rawData.filter(d => d.user_type === 1).length;
+        const returningCount = rawData.filter(d => d.user_type !== 1).length;
+        const userTypes = [
+            { _id: "First-time", count: firstTimeCount },
+            { _id: "Returning", count: returningCount }
+        ];
+
+        // -------- USER ACTIVITY ----------
+        const userActivityMap = new Map();
+        rawData.forEach(d => {
+            const email = safeStr(d.user_email).toLowerCase();
+            if (!email) return;
+            const qTime = asDate(d.query_time);
+            if (!userActivityMap.has(email)) {
+                userActivityMap.set(email, { email, queryCount: 0, lastActivity: null });
+            }
+            const entry = userActivityMap.get(email);
+            entry.queryCount += 1;
+            if (qTime && (!entry.lastActivity || qTime > new Date(entry.lastActivity))) {
+                entry.lastActivity = qTime.toISOString();
             }
         });
+        const userActivity = Array.from(userActivityMap.values()).sort((a, b) => b.queryCount - a.queryCount);
+
+        // -------- SESSION STATS ----------
+        const sessionMap = new Map();
+        rawData.forEach(d => {
+            const sid = safeStr(d.session_id);
+            const qTime = asDate(d.query_time);
+            if (!sid) return;
+            if (!sessionMap.has(sid)) {
+                sessionMap.set(sid, { count: 0, start: qTime, end: qTime });
+            }
+            const s = sessionMap.get(sid);
+            s.count += 1;
+            if (qTime) {
+                if (!s.start || qTime < s.start) s.start = qTime;
+                if (!s.end || qTime > s.end) s.end = qTime;
+            }
+        });
+        const queriesPerSession = Array.from(sessionMap.values()).map(s => s.count);
+        const durations = Array.from(sessionMap.values()).map(s => !s.start || !s.end ? 0 : Math.max(0, Math.round((s.end - s.start) / 1000)));
+        const avgQueriesPerSession = queriesPerSession.length
+            ? queriesPerSession.reduce((a, b) => a + b, 0) / queriesPerSession.length
+            : 0;
+
+        // -------- DUPLICATE QUERIES ----------
+        const qMap = new Map();
+        rawData.forEach(d => {
+            if (!d.question) return;
+            const qnorm = safeStr(d.question).toLowerCase().trim();
+            if (!qMap.has(qnorm)) qMap.set(qnorm, { query: qnorm, count: 0, users: new Set() });
+            const e = qMap.get(qnorm);
+            e.count += 1;
+            if (d.user_email) e.users.add(safeStr(d.user_email));
+        });
+        const duplicateQueries = Array.from(qMap.values())
+            .filter(x => x.count > 1)
+            .map(x => ({ query: x.query, count: x.count, users: Array.from(x.users) }))
+            .sort((a, b) => b.count - a.count);
+
+        // -------- QUERY COMPLEXITY ----------
+        const complexityByType = {};
+        rawData.forEach(d => {
+            const ut = d.user_type || 0;
+            const q = safeStr(d.question);
+            const len = q.length;
+            const tokens = q ? q.split(/\s+/).length : 0;
+            if (!complexityByType[ut]) complexityByType[ut] = { sumLen: 0, sumTokens: 0, count: 0 };
+            complexityByType[ut].sumLen += len;
+            complexityByType[ut].sumTokens += tokens;
+            complexityByType[ut].count += 1;
+        });
+        const queryComplexityByUserType = Object.entries(complexityByType).map(([userType, val]) => {
+            const label = (parseInt(userType) === 1 ? "First-time" : "Returning");
+            return {
+                userType: label,
+                avgLength: val.count ? (val.sumLen / val.count) : 0,
+                avgTokens: val.count ? (val.sumTokens / val.count) : 0,
+                count: val.count
+            };
+        }).sort((a, b) => b.count - a.count);
+
+        // -------- WEEKLY RETENTION ----------
+        const weekKey = (date) => {
+            const d = new Date(date);
+            const year = d.getUTCFullYear();
+            const week = Math.ceil((((d - new Date(Date.UTC(year, 0, 1))) / 86400000) + new Date(year, 0, 1).getUTCDay() + 1) / 7);
+            return `${year}-W${String(week).padStart(2, "0")}`;
+        };
+        const retentionMap = new Map();
+        rawData.forEach(d => {
+            const qTime = asDate(d.query_time);
+            const email = safeStr(d.user_email).toLowerCase();
+            if (!qTime || !email) return;
+            const wk = weekKey(qTime);
+            if (!retentionMap.has(wk)) retentionMap.set(wk, new Set());
+            retentionMap.get(wk).add(email);
+        });
+        const retentionWeekly = Array.from(retentionMap.entries())
+            .map(([week, users]) => ({ week, users: users.size }))
+            .sort((a, b) => a.week.localeCompare(b.week));
+
+        // -------- USER JOURNEY TRANSITIONS (TREE FORMAT) ----------
+        const transitionCounts = new Map();
+        const bySession = {};
+        rawData.forEach(d => {
+            const sid = safeStr(d.session_id);
+            if (!sid) return;
+            if (!bySession[sid]) bySession[sid] = [];
+            bySession[sid].push(d);
+        });
+        
+        Object.values(bySession).forEach(events => {
+            events.sort((a, b) => new Date(a.query_time) - new Date(b.query_time));
+            for (let i = 0; i < events.length - 1; i++) {
+                const fromRaw = safeStr(events[i].question).trim();
+                const toRaw = safeStr(events[i + 1].question).trim();
+                
+                // Extract key phrases (first 30 chars for cleaner display)
+                const from = fromRaw ? fromRaw.substring(0, 30) + (fromRaw.length > 30 ? "..." : "") : "Start";
+                const to = toRaw ? toRaw.substring(0, 30) + (toRaw.length > 30 ? "..." : "") : "Next";
+                
+                const key = `${from}|||${to}`; // Use delimiter for splitting later
+                transitionCounts.set(key, (transitionCounts.get(key) || 0) + 1);
+            }
+        });
+        
+        const userJourneyTransitions = Array.from(transitionCounts.entries())
+            .map(([transition, count]) => {
+                const [from, to] = transition.split("|||");
+                return { from, to, count };
+            })
+            .sort((a, b) => b.count - a.count);
+
+        // -------- ENGAGEMENT LEADERBOARD ----------
+        const engagementMap = new Map();
+        rawData.forEach(d => {
+            const email = safeStr(d.user_email).toLowerCase();
+            if (!email) return;
+            if (!engagementMap.has(email)) engagementMap.set(email, { email, queryCount: 0, success: 0 });
+            const e = engagementMap.get(email);
+            e.queryCount++;
+            if (safeStr(d.status).toLowerCase() === "success") e.success++;
+        });
+        const engagement = Array.from(engagementMap.values()).map(e => {
+            const successRate = e.queryCount ? Math.round((e.success / e.queryCount) * 100) : 0;
+            const score = e.queryCount * 0.7 + successRate * 0.3;
+            return { ...e, successRate, score: Math.round(score) };
+        }).sort((a, b) => b.score - a.score);
+
+        res.json({
+            userTypes,
+            userActivity,
+            queriesPerSession,
+            durations,
+            avgQueriesPerSession,
+            duplicateQueries,
+            retentionWeekly,
+            queryComplexityByUserType,
+            userJourneyTransitions,
+            engagement
+        });
+
+    } catch (err) {
+        console.error("Error in /api/users-data:", err);
+        res.status(500).json({ message: err.message || "Unknown error" });
+    }
+});
+
+
+
 
         app.get('/api/live-feed', async (req, res) => {
             try {
